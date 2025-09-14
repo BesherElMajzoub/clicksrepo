@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram bot to query daily clicks for sites listed on https://khadimat.com/administrator/api.php
+Telegram bot to query daily clicks for multiple sources and treat them as one.
 
 Commands:
   /start
@@ -16,8 +16,9 @@ import re
 import json
 import datetime as dt
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -25,7 +26,21 @@ from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-INDEX_URL = "https://khadimat.com/administrator/api.php"
+# -------- Sources configuration --------
+SOURCES = [
+    {"kind": "master", "url": "https://khadimat.com/administrator/api.php"},
+    {"kind": "master", "url": "https://sdadi-qarde.com/administrator/api.php"},
+    # Single clicks page treated as its own site
+    {
+        "kind": "clicks",
+        "url": "https://tasdedqard.com/view_clicks.php",
+        "name": "tasdedqard.com",
+        "domain": "tasdedqard.com",
+        "type": "single",
+    },
+]
+
+DEFAULT_TZ = "Europe/Berlin"
 
 
 def fetch_html(url: str, timeout: int = 20) -> str:
@@ -42,7 +57,8 @@ def fetch_html(url: str, timeout: int = 20) -> str:
     return r.text
 
 
-def parse_master_sites(html: str) -> List[Dict]:
+def parse_master_sites(html: str, source_url: str) -> List[Dict]:
+    """Parse a master table page with id=data-table and return site dicts."""
     soup = BeautifulSoup(html, "html.parser", from_encoding="utf-8")
     table = soup.find(id="data-table")
     sites = []
@@ -92,21 +108,9 @@ def parse_master_sites(html: str) -> List[Dict]:
                 "visits_url": visits_url,
                 "combined_url": combined_url,
                 "chart_url": chart_url,
+                "_source": source_url,
             })
     return sites
-
-
-def pick_site(sites: List[Dict], needle: str) -> Optional[Dict]:
-    if not needle:
-        return None
-    n = needle.lower()
-    domain_hits = [s for s in sites if n in s["domain"].lower()]
-    if domain_hits:
-        return sorted(domain_hits, key=lambda s: len(s["domain"]))[0]
-    name_hits = [s for s in sites if n in s["name"].lower()]
-    if name_hits:
-        return name_hits[0]
-    return None
 
 
 def parse_daily_clicks_page(html: str) -> List[Dict]:
@@ -114,7 +118,7 @@ def parse_daily_clicks_page(html: str) -> List[Dict]:
     rows = []
     for tr in soup.select("table tbody tr"):
         tds = tr.find_all("td")
-        if len(tds) != 3:
+        if len(tds) < 3:
             continue
         btn = tds[0].get_text(strip=True)
         date_text = tds[1].get_text(strip=True)
@@ -143,6 +147,98 @@ def summarize_for_date(records: List[Dict], target_date: str) -> Dict:
     return {"by_button": by_button, "total": total}
 
 
+def hostname_of(url_or_domain: str) -> str:
+    try:
+        netloc = urlparse(url_or_domain).netloc or url_or_domain
+    except Exception:
+        netloc = url_or_domain
+    host = netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def pick_site(sites: List[Dict], needle: str) -> Optional[Dict]:
+    if not needle:
+        return None
+    n = needle.strip().lower()
+    n_host = hostname_of(n)
+
+    # exact hostname match first
+    exact = [s for s in sites if hostname_of(s.get("domain", "")) == n_host]
+    if exact:
+        return sorted(exact, key=lambda s: len(s.get("domain","")))[0]
+
+    # partial domain contains
+    domain_hits = [s for s in sites if n in s.get("domain","").lower()]
+    if domain_hits:
+        return sorted(domain_hits, key=lambda s: len(s.get("domain","")))[0]
+
+    # name contains
+    name_hits = [s for s in sites if n in s.get("name","").lower()]
+    if name_hits:
+        return name_hits[0]
+    return None
+
+
+def build_single_clicks_site(entry: Dict) -> Dict:
+    """Create a 'site' dict for a standalone clicks page (e.g., tasdedqard.com)."""
+    name = entry.get("name") or entry.get("domain") or hostname_of(entry["url"])
+    domain = entry.get("domain") or hostname_of(entry["url"])
+    site = {
+        "name": name,
+        "domain": domain,
+        "type": entry.get("type") or "single",
+        "total_clicks": 0,  # may update below
+        "clear_url": "",
+        "view_clicks_url": entry["url"],
+        "visits_url": "",
+        "combined_url": "",
+        "chart_url": "",
+        "_source": entry["url"],
+    }
+    # Try to compute an overall total for listing (optional)
+    try:
+        html = fetch_html(entry["url"])
+        recs = parse_daily_clicks_page(html)
+        site["total_clicks"] = sum(r["count"] for r in recs)
+    except Exception:
+        # leave total_clicks as 0 if we can't parse
+        pass
+    return site
+
+
+def fetch_all_sites() -> List[Dict]:
+    """Fetch and merge sites from all configured sources."""
+    all_sites: List[Dict] = []
+    for src in SOURCES:
+        kind = src.get("kind")
+        url = src.get("url")
+        try:
+            if kind == "master":
+                html = fetch_html(url)
+                sites = parse_master_sites(html, url)
+                all_sites.extend(sites)
+            elif kind == "clicks":
+                site = build_single_clicks_site(src)
+                all_sites.append(site)
+        except Exception:
+            # Skip failing source but continue with others
+            continue
+
+    # Deduplicate by (domain, view_clicks_url)
+    dedup: Dict[Tuple[str, str], Dict] = {}
+    for s in all_sites:
+        key = (hostname_of(s.get("domain","")), s.get("view_clicks_url",""))
+        if key not in dedup:
+            dedup[key] = s
+        else:
+            # Prefer one with a non-zero total_clicks
+            if dedup[key].get("total_clicks", 0) == 0 and s.get("total_clicks", 0) > 0:
+                dedup[key] = s
+    return list(dedup.values())
+
+
 # ------------------ Telegram Handlers ------------------
 
 BOT_TOKEN = "8368293478:AAE4duF3MkcQzbmi86UcFJvuBH9TDTKeFd4"  # <<< ضع التوكن هنا
@@ -152,7 +248,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = (
         "أهلًا 👋\n"
         "الأوامر المتاحة:\n"
-        "• /list  — عرض جميع المواقع\n"
+        "• /list  — عرض جميع المواقع من كل المصادر\n"
         "• /klik <site> [YYYY-MM-DD] — نقرات موقع في تاريخ محدد (بدون التاريخ = اليوم)\n\n"
         "مثال:\n"
         "/klik khadimati.com 2025-09-13"
@@ -162,14 +258,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def list_sites(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        html = fetch_html(INDEX_URL)
-        sites = parse_master_sites(html)
+        sites = fetch_all_sites()
         if not sites:
-            await update.message.reply_text("لا توجد مواقع في الصفحة حالياً.")
+            await update.message.reply_text("لا توجد مواقع في المصادر حاليًا.")
             return
         lines = []
         for i, s in enumerate(sites, start=1):
-            lines.append(f"{i:2d}. {s['name']} | {s['domain']} | نوع: {s['type'] or '-'} | إجمالي: {s['total_clicks']}")
+            total = s.get("total_clicks", 0)
+            stype = s.get("type") or "-"
+            lines.append(
+                f"{i:2d}. {s['name']} | {s['domain']} | نوع: {stype} | إجمالي: {total}"
+            )
         text = "\n".join(lines)
         # Telegram limits ~4096 chars per message
         if len(text) <= 3900:
@@ -206,10 +305,9 @@ async def klik(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await update.message.reply_text("صيغة التاريخ يجب أن تكون YYYY-MM-DD")
                 return
         else:
-            target_date = dt.datetime.now(ZoneInfo("Europe/Berlin")).date().strftime("%Y-%m-%d")
+            target_date = dt.datetime.now(ZoneInfo(DEFAULT_TZ)).date().strftime("%Y-%m-%d")
 
-        master_html = fetch_html(INDEX_URL)
-        sites = parse_master_sites(master_html)
+        sites = fetch_all_sites()
         site = pick_site(sites, site_arg)
         if not site:
             await update.message.reply_text(f"لم أجد موقعاً يطابق: {site_arg}")
@@ -220,11 +318,19 @@ async def klik(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         summary = summarize_for_date(records, target_date)
 
         # Build response
-        header = f"الموقع: {site['name']} ({site['domain']})\nالتاريخ: {target_date}\n" + "-"*35
+        header = (
+            f"الموقع: {site['name']} ({site['domain']})\n"
+            f"المصدر: {site.get('_source','-')}\n"
+            f"التاريخ: {target_date}\n"
+            + "-" * 35
+        )
         if not summary["by_button"]:
             body = "\nلا توجد نقرات مسجلة لهذا التاريخ."
         else:
-            parts = [f"\n{btn}: {cnt}" for btn, cnt in summary["by_button"].items()]
+            # ثبّت ترتيب العرض (اختياري)
+            parts = []
+            for btn, cnt in sorted(summary["by_button"].items()):
+                parts.append(f"\n{btn}: {cnt}")
             parts.append(f"\n{'-'*15}\nالإجمالي: {summary['total']}")
             body = "".join(parts)
 
